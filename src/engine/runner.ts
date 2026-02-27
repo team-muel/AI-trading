@@ -12,7 +12,7 @@ async function runSymbolOnce(symbol: string) {
   if (!latestTs) return;
 
   const lastTs = await getLastProcessedTs(symbol);
-  if (lastTs && latestTs <= lastTs) return; // 새 봉 없음
+  if (lastTs && latestTs <= lastTs) return;
 
   const candles = await fetchRecentCandles(symbol, config.candleLookback);
   if (candles.length < config.cvdLen + 2) return;
@@ -32,42 +32,44 @@ async function runSymbolOnce(symbol: string) {
     crossedUnder(cvd[prev], cvdMa[prev], cvd[i], cvdMa[i]);
 
   const price = candles[i].close;
-  const equity = config.initialCapital; // (추후 거래소 잔고로 대체 가능)
-
-  // ✅ 중복 진입 방지: 포지션 있으면 스킵
-  if ((longCond || shortCond) && (await hasOpenPosition(symbol))) {
-    console.log(`[bot] ${symbol} signal but position already open → skip`);
-    await setLastProcessedTs(symbol, latestTs);
-    return;
-  }
-
-  const { qty } = sizeByExposure({
-    equity,
-    riskPct: config.riskPct,
-    leverage: config.leverage,
-    price,
-  });
 
   if (longCond || shortCond) {
-    const side = longCond ? "long" : "short";
-    const tpPrice = longCond
-      ? price * (1 + config.tpPct / 100)
-      : price * (1 - config.tpPct / 100);
-    const slPrice = longCond
-      ? price * (1 - config.slPct / 100)
-      : price * (1 + config.slPct / 100);
+    // 포지션 중복 진입 방지
+    if (await hasOpenPosition(symbol)) {
+      console.log(`[bot] ${symbol} signal but position already open → skip`);
+    } else {
+      const equity = config.initialCapital;
+      const { qty } = sizeByExposure({
+        equity,
+        riskPct: config.riskPct,
+        leverage: config.leverage,
+        price,
+      });
 
-    console.log(`[bot] ${symbol} ${side} signal @${price} qty=${qty} dryRun=${config.dryRun}`);
+      const side = longCond ? "long" : "short";
+      const tpPrice = longCond
+        ? price * (1 + config.tpPct / 100)
+        : price * (1 - config.tpPct / 100);
+      const slPrice = longCond
+        ? price * (1 - config.slPct / 100)
+        : price * (1 + config.slPct / 100);
 
-    await placeEntryWithTpSl({
-  symbol,
-  side,
-  qty,
-  entryPrice: price,
-  tpPrice,
-  slPrice,
-});
+      console.log(
+        `[bot] ${symbol} ${side} signal @${price} qty=${qty} dryRun=${config.dryRun}`
+      );
 
+      await placeEntryWithTpSl({
+        symbol,
+        side,
+        qty,
+        entryPrice: price,
+        tpPrice,
+        slPrice,
+      });
+    }
+  }
+
+  // ✅ 신호가 있든 없든 "이 최신 봉은 처리했다"로 기록해야 중복 처리 방지됨
   await setLastProcessedTs(symbol, latestTs);
 }
 
@@ -78,7 +80,6 @@ export async function runOnce() {
     } catch (e: any) {
       console.error(`[bot] ${symbol} error:`, e?.message ?? e);
     }
-    // 레이트리밋 완화
     await new Promise((r) => setTimeout(r, 250));
   }
 }
