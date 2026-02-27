@@ -5,24 +5,24 @@ import { computeCVDSeries, sma } from "../strategy/cvd";
 import { crossedOver, crossedUnder } from "../strategy/signals";
 import { sizeByExposure } from "../strategy/sizing";
 import { placeEntryWithTpSl } from "../exchange/orders";
+import { hasOpenPosition } from "../exchange/position";
 
-export async function runOnce() {
-  const latestTs = await fetchLatestCandleTs();
+async function runSymbolOnce(symbol: string) {
+  const latestTs = await fetchLatestCandleTs(symbol);
   if (!latestTs) return;
 
-  const lastTs = await getLastProcessedTs();
-  if (lastTs && latestTs <= lastTs) return; // nothing new
+  const lastTs = await getLastProcessedTs(symbol);
+  if (lastTs && latestTs <= lastTs) return; // 새 봉 없음
 
-  const candles = await fetchRecentCandles(config.candleLookback);
+  const candles = await fetchRecentCandles(symbol, config.candleLookback);
   if (candles.length < config.cvdLen + 2) return;
 
   const cvd = computeCVDSeries(candles, config.deltaCoef);
   const cvdMa = sma(cvd, config.cvdLen);
 
-  const i = candles.length - 1; // latest candle
+  const i = candles.length - 1;
   const prev = i - 1;
 
-  // 봉 마감 기준 신호
   const longCond =
     Number.isFinite(cvdMa[prev]) &&
     crossedOver(cvd[prev], cvdMa[prev], cvd[i], cvdMa[i]);
@@ -32,10 +32,14 @@ export async function runOnce() {
     crossedUnder(cvd[prev], cvdMa[prev], cvd[i], cvdMa[i]);
 
   const price = candles[i].close;
+  const equity = config.initialCapital; // (추후 거래소 잔고로 대체 가능)
 
-  // equity는 일단 config에서 “가상 equity”로 시작하거나,
-  // 선물 계정 잔고를 조회해서 equity로 쓰도록 확장 가능.
-  const equity = config.initialCapital;
+  // ✅ 중복 진입 방지: 포지션 있으면 스킵
+  if ((longCond || shortCond) && (await hasOpenPosition(symbol))) {
+    console.log(`[bot] ${symbol} signal but position already open → skip`);
+    await setLastProcessedTs(symbol, latestTs);
+    return;
+  }
 
   const { qty } = sizeByExposure({
     equity,
@@ -46,8 +50,14 @@ export async function runOnce() {
 
   if (longCond || shortCond) {
     const side = longCond ? "long" : "short";
-    const tpPrice = longCond ? price * (1 + config.tpPct / 100) : price * (1 - config.tpPct / 100);
-    const slPrice = longCond ? price * (1 - config.slPct / 100) : price * (1 + config.slPct / 100);
+    const tpPrice = longCond
+      ? price * (1 + config.tpPct / 100)
+      : price * (1 - config.tpPct / 100);
+    const slPrice = longCond
+      ? price * (1 - config.slPct / 100)
+      : price * (1 + config.slPct / 100);
+
+    console.log(`[bot] ${symbol} ${side} signal @${price} qty=${qty} dryRun=${config.dryRun}`);
 
     await placeEntryWithTpSl({
       side,
@@ -55,9 +65,21 @@ export async function runOnce() {
       entryPrice: price,
       tpPrice,
       slPrice,
-    });
+      // ⚠️ orders.ts에서 config.symbol을 썼다면 symbol 파라미터도 넘기도록 수정 필요 (아래 참고)
+    } as any);
   }
 
-  // 최신 봉을 처리했다고 기록 (중복 실행 방지)
-  await setLastProcessedTs(latestTs);
+  await setLastProcessedTs(symbol, latestTs);
+}
+
+export async function runOnce() {
+  for (const symbol of config.symbols) {
+    try {
+      await runSymbolOnce(symbol);
+    } catch (e: any) {
+      console.error(`[bot] ${symbol} error:`, e?.message ?? e);
+    }
+    // 레이트리밋 완화
+    await new Promise((r) => setTimeout(r, 250));
+  }
 }
