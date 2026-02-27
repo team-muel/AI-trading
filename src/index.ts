@@ -4,7 +4,7 @@ import { runOnce } from "./engine/runner";
 async function main() {
   console.log(`[bot] start`, {
     exchange: config.exchange,
-    symbol: config.symbol,
+    symbol: config.symbols,
     timeframe: config.timeframe,
     dryRun: config.dryRun,
   });
