@@ -6,6 +6,19 @@ function must(k: string) {
   return v;
 }
 
+function parseSymbols(): string[] {
+  const symbols = (process.env.SYMBOLS ?? "").trim();
+  if (symbols) {
+    return symbols
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  // fallback: 기존 단일 SYMBOL 지원
+  const single = process.env.SYMBOL ?? "BTC/USDT";
+  return [single.trim()];
+}
+
 export const config = {
   // Supabase
   supabaseUrl: must("SUPABASE_URL"),
@@ -13,7 +26,7 @@ export const config = {
 
   // Trading
   exchange: process.env.EXCHANGE ?? "binance",
-  symbol: process.env.SYMBOL ?? "BTC/USDT",
+  symbols: parseSymbols(),                 // ✅ 추가
   timeframe: process.env.TIMEFRAME ?? "30m",
 
   // Strategy params
@@ -36,6 +49,5 @@ export const config = {
   // Safety
   dryRun: (process.env.DRY_RUN ?? "true") === "true",
 
-  // Backtest-ish equity seed (추후 거래소 잔고 연동 가능)
   initialCapital: 3000,
 };
