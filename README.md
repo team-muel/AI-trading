@@ -1,49 +1,19 @@
-AI-trading/
-  README.md
-  .gitignore
-  LICENSE
+### 1) Supabase DB 준비
+1. SQL Editor에서 `supabase/migrations/001_init.sql` 실행
+2. (선택) `002_features.sql` 실행
 
-  supabase/
-    migrations/
-      001_init.sql
-      002_features.sql
-    functions/
-      polygon_ingest/
-        index.ts
-      build_features/
-        index.ts
-      generate_signals/
-        index.ts
-      execute_orders/          # (선택) Edge로 주문까지 하고 싶다면
-        index.ts
+### 2) Secrets 설정 (Supabase)
+- `POLYGON_API_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- (선택) `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`
 
-  ingestion/                  # (선택) 로컬/백필용
-    polygon_backfill.py
-    universe_update.py
+### 3) Edge Functions 배포
+- `polygon_ingest`: Polygon → bars_1m upsert
+- `build_features`: bars_1m → features_1m 갱신
+- `generate_signals`: features_1m → signals 기록
 
-  ml/
-    training/
-      train_ranker.py
-      train_classifier.py
-    backtest/
-      event_backtest.py
-    features/
-      feature_defs.py
+### 4) Cron 스케줄
+- pg_cron + pg_net으로 1분/5분마다 함수 호출
 
-  trading/
-    broker/
-      alpaca.py               # 또는 ibkr.py
-    runner/
-      order_executor.py       # signals 읽고 주문 실행
-
-  configs/
-    config.yaml
-    symbols_top1000.csv       # (초기 시드)
-  
-  scripts/
-    bootstrap_supabase.sql
-    run_local.sh
-
-  .github/
-    workflows/
-      ci.yml
+### 5) 운영 흐름
+Cron → polygon_ingest → build_features → generate_signals → (execute_orders or 외부 실행기)
