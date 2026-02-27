@@ -60,14 +60,13 @@ async function runSymbolOnce(symbol: string) {
     console.log(`[bot] ${symbol} ${side} signal @${price} qty=${qty} dryRun=${config.dryRun}`);
 
     await placeEntryWithTpSl({
-      side,
-      qty,
-      entryPrice: price,
-      tpPrice,
-      slPrice,
-      // ⚠️ orders.ts에서 config.symbol을 썼다면 symbol 파라미터도 넘기도록 수정 필요 (아래 참고)
-    } as any);
-  }
+  symbol,
+  side,
+  qty,
+  entryPrice: price,
+  tpPrice,
+  slPrice,
+});
 
   await setLastProcessedTs(symbol, latestTs);
 }
