@@ -15,7 +15,10 @@ async function runSymbolOnce(symbol: string) {
   if (lastTs && latestTs <= lastTs) return;
 
   const candles = await fetchRecentCandles(symbol, config.candleLookback);
-  if (candles.length < config.cvdLen + 2) return;
+  if (candles.length < config.cvdLen + 2) {
+    await setLastProcessedTs(symbol, latestTs);
+    return;
+  }
 
   const cvd = computeCVDSeries(candles, config.deltaCoef);
   const cvdMa = sma(cvd, config.cvdLen);
@@ -34,13 +37,17 @@ async function runSymbolOnce(symbol: string) {
   const price = candles[i].close;
 
   if (longCond || shortCond) {
-    // 포지션 중복 진입 방지
+    // 중복 진입 방지 (실주문에서만 의미 큼)
     if (await hasOpenPosition(symbol)) {
       console.log(`[bot] ${symbol} signal but position already open → skip`);
     } else {
-      const equity = config.initialCapital;
+      // 자본 분할 옵션
+      const equityBase = config.equitySplit
+        ? config.initialCapital / config.symbols.length
+        : config.initialCapital;
+
       const { qty } = sizeByExposure({
-        equity,
+        equity: equityBase,
         riskPct: config.riskPct,
         leverage: config.leverage,
         price,
@@ -69,7 +76,7 @@ async function runSymbolOnce(symbol: string) {
     }
   }
 
-  // ✅ 신호가 있든 없든 "이 최신 봉은 처리했다"로 기록해야 중복 처리 방지됨
+  // 신호가 있든 없든 최신 봉 처리 완료로 기록
   await setLastProcessedTs(symbol, latestTs);
 }
 
@@ -80,6 +87,6 @@ export async function runOnce() {
     } catch (e: any) {
       console.error(`[bot] ${symbol} error:`, e?.message ?? e);
     }
-    await new Promise((r) => setTimeout(r, 250));
+    await new Promise((r) => setTimeout(r, 200));
   }
 }
