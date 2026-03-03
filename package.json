@@ -5,6 +5,7 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "ingest": "tsx src/ingest/binance_to_supabase.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js"
   },
