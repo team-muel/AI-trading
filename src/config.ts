@@ -14,9 +14,8 @@ function parseSymbols(): string[] {
       .map((s) => s.trim())
       .filter(Boolean);
   }
-  // fallback: 기존 단일 SYMBOL 지원
-  const single = process.env.SYMBOL ?? "BTC/USDT";
-  return [single.trim()];
+  const single = (process.env.SYMBOL ?? "BTC/USDT").trim();
+  return [single];
 }
 
 export const config = {
@@ -25,8 +24,8 @@ export const config = {
   supabaseServiceRoleKey: must("SUPABASE_SERVICE_ROLE_KEY"),
 
   // Trading
-  exchange: process.env.EXCHANGE ?? "binance",
-  symbols: parseSymbols(),                 // ✅ 추가
+  exchange: (process.env.EXCHANGE ?? "binance").toLowerCase(),
+  symbols: parseSymbols(),
   timeframe: process.env.TIMEFRAME ?? "30m",
 
   // Strategy params
@@ -37,7 +36,7 @@ export const config = {
   slPct: Number(process.env.SL_PCT ?? 2.0),
   leverage: Number(process.env.LEVERAGE ?? 20),
 
-  // Exchange
+  // Exchange keys
   binanceApiKey: must("BINANCE_API_KEY"),
   binanceApiSecret: must("BINANCE_API_SECRET"),
   binanceFutures: (process.env.BINANCE_FUTURES ?? "true") === "true",
@@ -49,5 +48,7 @@ export const config = {
   // Safety
   dryRun: (process.env.DRY_RUN ?? "true") === "true",
 
-  initialCapital: 3000,
+  // Capital handling
+  initialCapital: Number(process.env.INITIAL_CAPITAL ?? 3000),
+  equitySplit: (process.env.EQUITY_SPLIT ?? "true") === "true",
 };
