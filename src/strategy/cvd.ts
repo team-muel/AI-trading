@@ -1,5 +1,5 @@
 export type Candle = {
-  ts: string; // ISO
+  ts: string;
   open: number;
   close: number;
   volume: number;
@@ -20,7 +20,7 @@ export function computeCVDSeries(candles: Candle[], deltaCoef: number): number[]
 }
 
 export function sma(series: number[], len: number): number[] {
-  const out: number[] = new Array(series.length).fill(NaN);
+  const out: number[] = new Array(series.length).fill(Number.NaN);
   let sum = 0;
   for (let i = 0; i < series.length; i++) {
     sum += series[i];
