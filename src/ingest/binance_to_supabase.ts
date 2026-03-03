@@ -22,12 +22,8 @@ const SYMBOLS = (process.env.SYMBOLS ?? "BTC/USDT")
   .filter(Boolean);
 
 const POLL_SECONDS = Number(process.env.INGEST_POLL_SECONDS ?? 30);
-
-// Backfill controls
-// - If DB is empty for a symbol, start from (now - BACKFILL_DAYS)
-// - Otherwise continue from latest ts in DB
 const BACKFILL_DAYS = Number(process.env.BACKFILL_DAYS ?? 365);
-const MAX_PAGES_PER_SYMBOL = Number(process.env.MAX_PAGES_PER_SYMBOL ?? 200); // safety cap
+const MAX_PAGES_PER_SYMBOL = Number(process.env.MAX_PAGES_PER_SYMBOL ?? 200);
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
@@ -55,7 +51,7 @@ type CandleRow = {
   exchange: string;
   symbol: string;
   timeframe: string;
-  ts: string; // ISO string (UTC)
+  ts: string;
   open: number;
   high: number;
   low: number;
@@ -83,14 +79,11 @@ async function upsertCandles(rows: CandleRow[]) {
   const { error } = await supabase
     .from("candles")
     .upsert(rows, { onConflict: "exchange,symbol,timeframe,ts" });
-
   if (error) throw error;
 }
 
 function makeExchange() {
   if (EXCHANGE !== "binance") throw new Error(`Only binance supported now: ${EXCHANGE}`);
-
-  // OHLCV fetch는 키 없이도 가능하지만, 제한/안정성 때문에 키 넣는 걸 추천
   const ex: any = new ccxt.binance({
     enableRateLimit: true,
     apiKey: process.env.BINANCE_API_KEY,
@@ -99,11 +92,9 @@ function makeExchange() {
       defaultType: (process.env.BINANCE_FUTURES ?? "true") === "true" ? "future" : "spot",
     },
   });
-
   return ex;
 }
 
-// Safety: drop last candle which can be still forming
 function dropUnclosed(ohlcvRaw: ccxt.OHLCV[]): ccxt.OHLCV[] {
   if (!ohlcvRaw || ohlcvRaw.length === 0) return [];
   if (ohlcvRaw.length === 1) return [];
@@ -115,8 +106,6 @@ async function ingestSymbol(ex: any, symbol: string) {
   const limit = 1000;
 
   const latestMs = await getLatestTsFromDB(symbol);
-
-  // if empty DB: start from now - BACKFILL_DAYS
   const earliestTarget = Date.now() - BACKFILL_DAYS * 24 * 60 * 60 * 1000;
   let since = latestMs ? latestMs + 1 : earliestTarget;
 
@@ -127,7 +116,6 @@ async function ingestSymbol(ex: any, symbol: string) {
     pages += 1;
 
     const ohlcvRaw: ccxt.OHLCV[] = await ex.fetchOHLCV(symbol, TIMEFRAME, since, limit);
-
     if (!ohlcvRaw || ohlcvRaw.length === 0) break;
 
     const ohlcv = dropUnclosed(ohlcvRaw);
@@ -162,13 +150,9 @@ async function ingestSymbol(ex: any, symbol: string) {
     const lastMs = new Date(last).getTime();
     since = lastMs + 1;
 
-    // stop when we're close to "now" (2 candles buffer)
     if (since >= Date.now() - tfMs * 2) break;
-
-    // safety cap to avoid running forever
     if (pages >= MAX_PAGES_PER_SYMBOL) break;
 
-    // rate-limit friendly delay
     await new Promise((r) => setTimeout(r, 250));
   }
 
@@ -187,12 +171,6 @@ async function main() {
     maxPagesPerSymbol: MAX_PAGES_PER_SYMBOL,
   });
 
-  console.log("[ingest] env check", {
-    supabaseUrlPrefix: process.env.SUPABASE_URL?.slice(0, 24),
-    timeframe: process.env.TIMEFRAME,
-    symbols: process.env.SYMBOLS,
-  });
-
   const ex = makeExchange();
   await ex.loadMarkets();
 
@@ -205,7 +183,6 @@ async function main() {
       }
       await new Promise((r) => setTimeout(r, 250));
     }
-
     await new Promise((r) => setTimeout(r, POLL_SECONDS * 1000));
   }
 }
