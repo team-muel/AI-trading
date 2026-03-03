@@ -1,3 +1,4 @@
+// src/exchange/orders.ts
 import { config } from "../config";
 import { makeBinance } from "./binance";
 import { normalizeQty } from "./qty";
@@ -10,7 +11,7 @@ export async function placeEntryWithTpSl(params: {
   tpPrice: number;
   slPrice: number;
 }) {
-  // DRY_RUN이면 주문 안 넣음
+  // DRY_RUN이면 주문 안 넣고 결과만 반환
   if (config.dryRun) {
     return { entry: null, tp: null, sl: null, dryRun: true, params };
   }
@@ -18,16 +19,18 @@ export async function placeEntryWithTpSl(params: {
   const ex: any = makeBinance();
   await ex.loadMarkets();
 
-  // ✅ 바이낸스 수량 규칙 맞추기
+  // ✅ 바이낸스 수량 규칙(precision) 맞추기
   const qty = await normalizeQty(params.symbol, params.qty);
 
   const isLong = params.side === "long";
   const entrySide = isLong ? "buy" : "sell";
   const exitSide = isLong ? "sell" : "buy";
 
+  // 1) 진입(시장가)
   const entry = await ex.createOrder(params.symbol, "market", entrySide, qty);
 
-  // ⚠️ TP/SL 타입은 계정/마켓 설정에 따라 다르게 동작할 수 있음
+  // 2) 익절/손절(조건 주문)
+  // ⚠️ 바이낸스 선물에서는 계정/설정에 따라 주문 타입/파라미터가 다르게 동작할 수 있음
   const tp = await ex.createOrder(
     params.symbol,
     "take_profit_market",
