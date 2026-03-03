@@ -12,11 +12,12 @@ export async function fetchRecentCandles(symbol: string, limit: number) {
     .limit(limit);
 
   if (error) throw error;
+
   return (data ?? []).map((r) => ({
     ts: r.ts as string,
-    open: Number(r.open),
-    close: Number(r.close),
-    volume: Number(r.volume),
+    open: Number((r as any).open),
+    close: Number((r as any).close),
+    volume: Number((r as any).volume),
   }));
 }
 
@@ -31,5 +32,5 @@ export async function fetchLatestCandleTs(symbol: string) {
     .limit(1);
 
   if (error) throw error;
-  return data?.[0]?.ts as string | undefined;
+  return (data?.[0]?.ts as string | undefined) ?? undefined;
 }
