@@ -1,3 +1,4 @@
+// src/engine/runner.ts
 import { config } from "../config";
 import { fetchLatestCandleTs, fetchRecentCandles } from "../supabase/candles";
 import { getLastProcessedTs, setLastProcessedTs } from "../supabase/botState";
@@ -6,6 +7,7 @@ import { crossedOver, crossedUnder } from "../strategy/signals";
 import { sizeByExposure } from "../strategy/sizing";
 import { placeEntryWithTpSl } from "../exchange/orders";
 import { hasOpenPosition } from "../exchange/position";
+import { insertTrade } from "../supabase/trades";
 
 async function runSymbolOnce(symbol: string) {
   const latestTs = await fetchLatestCandleTs(symbol);
@@ -37,11 +39,10 @@ async function runSymbolOnce(symbol: string) {
   const price = candles[i].close;
 
   if (longCond || shortCond) {
-    // 중복 진입 방지 (실주문에서만 의미 큼)
+    // 실주문에서만 의미 큰 중복 진입 방지
     if (await hasOpenPosition(symbol)) {
       console.log(`[bot] ${symbol} signal but position already open → skip`);
     } else {
-      // 자본 분할 옵션
       const equityBase = config.equitySplit
         ? config.initialCapital / config.symbols.length
         : config.initialCapital;
@@ -65,18 +66,89 @@ async function runSymbolOnce(symbol: string) {
         `[bot] ${symbol} ${side} signal @${price} qty=${qty} dryRun=${config.dryRun}`
       );
 
-      await placeEntryWithTpSl({
+      // ✅ 1) 신호 기록(드라이런/실거래 모두) — 검증용
+      await insertTrade({
         symbol,
         side,
-        qty,
+        entryTs: latestTs,      // 신호가 확정된 "최신 봉 ts"
         entryPrice: price,
+        qty,
         tpPrice,
         slPrice,
+        status: "open",
+        meta: {
+          kind: "signal",
+          dryRun: config.dryRun,
+          params: {
+            cvdLen: config.cvdLen,
+            deltaCoef: config.deltaCoef,
+            tpPct: config.tpPct,
+            slPct: config.slPct,
+            leverage: config.leverage,
+            equitySplit: config.equitySplit,
+          },
+        },
       });
+
+      // ✅ 2) 주문 실행(실거래일 때만 실제로 주문) + 주문 결과 기록
+      try {
+        const res = await placeEntryWithTpSl({
+          symbol,
+          side,
+          qty,
+          entryPrice: price,
+          tpPrice,
+          slPrice,
+        });
+
+        // 실거래면 주문ID 기록 row 추가
+        if (!res?.dryRun) {
+          const orderIds = {
+            entryId: res?.entry?.id ?? null,
+            tpId: res?.tp?.id ?? null,
+            slId: res?.sl?.id ?? null,
+          };
+
+          await insertTrade({
+            symbol,
+            side,
+            entryTs: latestTs,
+            entryPrice: price,
+            qty,
+            tpPrice,
+            slPrice,
+            status: "open",
+            orderIds,
+            meta: {
+              kind: "order_placed",
+              dryRun: false,
+            },
+          });
+        }
+      } catch (e: any) {
+        // 주문 실패 기록
+        await insertTrade({
+          symbol,
+          side,
+          entryTs: latestTs,
+          entryPrice: price,
+          qty,
+          tpPrice,
+          slPrice,
+          status: "error",
+          meta: {
+            kind: "order_failed",
+            dryRun: config.dryRun,
+            error: e?.message ?? String(e),
+          },
+        });
+
+        console.error(`[bot] ${symbol} order error:`, e?.message ?? e);
+      }
     }
   }
 
-  // 신호가 있든 없든 최신 봉 처리 완료로 기록
+  // ✅ 신호가 있든 없든 최신 봉 처리 완료로 기록
   await setLastProcessedTs(symbol, latestTs);
 }
 
