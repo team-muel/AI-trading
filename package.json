@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "npx tsx src/index.ts",
     "ingest": "npx tsx src/ingest/binance_to_supabase.ts",
+    "ingest:aggdump": "npx tsx src/tick/backfill_aggtrades_dump.ts",
     "backtest": "npx tsx src/backtest/backtest_1y.ts",
     "backtest:tv": "npx tsx src/backtest/backtest_tv_1y.ts",
+    "backtest:tv:chunked": "npx tsx src/backtest/backtest_tv_chunked.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "tick": "npx tsx src/tick/index.ts",
@@ -20,7 +22,9 @@
     "ws": "^8.19.0"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
     "@types/ws": "^8.18.1",
+    "adm-zip": "^0.5.16",
     "tsx": "^4.21.0",
     "typescript": "^5.6.3"
   }
