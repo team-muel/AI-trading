@@ -1,46 +1,53 @@
 // src/backtest/backtest_1y.ts
 import "dotenv/config";
 import fs from "fs";
-import ccxt from "ccxt";
 import { createClient } from "@supabase/supabase-js";
 
-// ---------- env ----------
+// ---------- env helpers ----------
 function must(k: string) {
   const v = process.env[k];
   if (!v) throw new Error(`Missing env: ${k}`);
   return v;
 }
 
+// ---------- config ----------
 const SUPABASE_URL = must("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = must("SUPABASE_SERVICE_ROLE_KEY");
 
 const EXCHANGE = (process.env.EXCHANGE ?? "binance").toLowerCase();
-const TIMEFRAME = process.env.TIMEFRAME ?? "30m";
 const SYMBOLS = (process.env.SYMBOLS ?? "BTC/USDT")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Strategy params
+// ✅ 30m 백테스트 고정
+const TIMEFRAME = "30m";
+
+// Strategy params (TradingView 입력값)
 const CVD_LEN = Number(process.env.CVD_LEN ?? 19);
 const DELTA_COEF = Number(process.env.DELTA_COEF ?? 1.0);
-const RISK_PCT = Number(process.env.RISK_PCT ?? 2.0);
 const TP_PCT = Number(process.env.TP_PCT ?? 4.0);
 const SL_PCT = Number(process.env.SL_PCT ?? 2.0);
 const LEVERAGE = Number(process.env.LEVERAGE ?? 20);
 
-// Backtest params (TV-like)
+// TV 기본 주문 크기 10% 반영
+const ORDER_PCT = Number(process.env.BT_ORDER_PCT ?? 10);
+
+// Portfolio capital
 const INITIAL_CAPITAL = Number(process.env.INITIAL_CAPITAL ?? 3000);
 const EQUITY_SPLIT = (process.env.EQUITY_SPLIT ?? "true") === "true";
-const SLIPPAGE_TICKS = Number(process.env.BT_SLIPPAGE_TICKS ?? 2);
-const PYRAMIDING = Number(process.env.BT_PYRAMIDING ?? 2); // TradingView pyramiding=2
 
+// Fees (Binance basic taker assumption)
 const BINANCE_FUTURES = (process.env.BINANCE_FUTURES ?? "true") === "true";
-
-// Binance basic fee assumptions (VIP0, no discount), taker used for safety
-// Futures: 0.04%/side, Spot: 0.10%/side
 const FEE_PER_SIDE_PCT = BINANCE_FUTURES ? 0.04 : 0.10;
 const FEE_ROUNDTRIP_PCT = FEE_PER_SIDE_PCT * 2;
+
+// Backtest assumptions
+// - Signal on bar close
+// - Entry at NEXT bar open (no look-ahead)
+// - TP/SL checked on subsequent bars (intrabar using OHLC)
+// - If TP and SL are both touched in same bar: SL first (conservative)
+const SL_FIRST_IF_BOTH = (process.env.BT_SL_FIRST ?? "true") === "true";
 
 // 1 year window
 const END_MS = Date.now();
@@ -48,13 +55,14 @@ const START_MS = END_MS - 365 * 24 * 60 * 60 * 1000;
 const START_ISO = new Date(START_MS).toISOString();
 const END_ISO = new Date(END_MS).toISOString();
 
+// Supabase client
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
 // ---------- types ----------
 type Candle = {
-  ts: string;
+  ts: string; // ISO UTC
   open: number;
   high: number;
   low: number;
@@ -73,12 +81,11 @@ type Trade = {
   exitPrice: number;
   reason: "tp" | "sl" | "eod";
   qty: number;
-  pnl: number;      // quote currency
-  pnlPct: number;   // percent of entry notional (approx)
-  entries: number;  // pyramiding count used
+  pnl: number;     // quote currency
+  pnlPct: number;  // percent of entry notional (approx)
 };
 
-// ---------- helpers ----------
+// ---------- indicator helpers ----------
 function sma(series: number[], len: number): number[] {
   const out = new Array(series.length).fill(Number.NaN);
   let sum = 0;
@@ -108,25 +115,10 @@ function crossedUnder(prevA: number, prevB: number, curA: number, curB: number) 
   return prevA >= prevB && curA < curB;
 }
 
-// Slippage: adverse movement in price by ticks
-function applySlippage(price: number, side: Side, isEntry: boolean, tickSize: number) {
-  const slip = SLIPPAGE_TICKS * tickSize;
-  // Entry:
-  // - long entry worse = higher
-  // - short entry worse = lower
-  // Exit:
-  // - long exit worse = lower
-  // - short exit worse = higher
-  if (isEntry) {
-    return side === "long" ? price + slip : price - slip;
-  } else {
-    return side === "long" ? price - slip : price + slip;
-  }
-}
-
-// ---------- supabase fetch (paged) ----------
-async function fetchCandles1y(symbol: string): Promise<Candle[]> {
-  const pageSize = 5000;
+// ---------- Supabase fetch (paged) ----------
+// ✅ PostgREST cap 대응: pageSize=1000 고정
+async function fetchCandles1y30m(symbol: string): Promise<Candle[]> {
+  const pageSize = 1000;
   let from = 0;
   const all: Candle[] = [];
 
@@ -155,96 +147,68 @@ async function fetchCandles1y(symbol: string): Promise<Candle[]> {
 
     all.push(...rows);
 
+    // 마지막 페이지
     if (rows.length < pageSize) break;
+
     from += pageSize;
   }
 
   return all;
 }
 
-// ---------- tick size via ccxt ----------
-function pow10(n: number) {
-  return Math.pow(10, n);
+// ---------- sizing (TV 기본 주문 10% * leverage) ----------
+function computeQty(equity: number, entryPrice: number) {
+  const notional = equity * (ORDER_PCT / 100) * LEVERAGE;
+  return notional / entryPrice;
 }
 
-function inferTickSizeFromPrecision(prec?: number) {
-  if (typeof prec !== "number" || !Number.isFinite(prec)) return null;
-  return 1 / pow10(prec);
-}
-
-function inferTickSizeFromMarketInfo(m: any) {
-  // Binance market.info.filters -> PRICE_FILTER.tickSize
-  try {
-    const filters = m?.info?.filters;
-    if (Array.isArray(filters)) {
-      const pf = filters.find((x: any) => x?.filterType === "PRICE_FILTER");
-      const ts = Number(pf?.tickSize);
-      if (Number.isFinite(ts) && ts > 0) return ts;
-    }
-  } catch {}
-  return null;
-}
-
-async function getTickSize(ex: any, symbol: string): Promise<number> {
-  await ex.loadMarkets();
-  const m = ex.market(symbol);
-  const fromInfo = inferTickSizeFromMarketInfo(m);
-  if (fromInfo) return fromInfo;
-
-  const p = m?.precision?.price;
-  const fromPrec = inferTickSizeFromPrecision(p);
-  if (fromPrec) return fromPrec;
-
-  // fallback: very rough default
-  return 0.01;
-}
-
-// ---------- sizing (same as bot: exposure-style) ----------
-function computeQty(equity: number, price: number) {
-  const exposure = equity * (RISK_PCT / 100) * LEVERAGE;
-  return exposure / price;
-}
-
-// ---------- backtest core (with pyramiding/slippage/fee) ----------
-function runBacktestForSymbol(symbol: string, candles: Candle[], capital: number, tickSize: number) {
+// ---------- backtest for one symbol ----------
+function backtestSymbol(symbol: string, candles: Candle[], startEquity: number) {
   const trades: Trade[] = [];
   const equityCurve: { ts: string; equity: number }[] = [];
 
+  // Need enough bars for SMA + signals
   if (candles.length < CVD_LEN + 5) {
-    return { trades, equityCurve, summary: { symbol, note: "not enough candles" } };
+    return {
+      symbol,
+      skipped: true,
+      reason: `not enough candles (${candles.length})`,
+      trades,
+      startEquity,
+      endEquity: startEquity,
+      totalPnl: 0,
+      totalReturnPct: 0,
+      maxDrawdownPct: 0,
+      winRatePct: 0,
+      wins: 0,
+      losses: 0,
+      count: 0,
+    };
   }
 
   const cvd = computeCvd(candles, DELTA_COEF);
   const cvdMa = sma(cvd, CVD_LEN);
 
-  let equity = capital;
+  let equity = startEquity;
 
-  // position (aggregated)
   let inPos = false;
   let side: Side = "long";
+  let entryPrice = 0;
   let entryTs = "";
-  let avgEntry = 0;      // weighted avg entry
-  let qty = 0;           // total qty
-  let entries = 0;       // number of pyramid entries used
   let tp = 0;
   let sl = 0;
+  let qty = 0;
 
   const feeFracRoundtrip = FEE_ROUNDTRIP_PCT / 100;
 
-  function recomputeTpSl() {
-    tp = side === "long" ? avgEntry * (1 + TP_PCT / 100) : avgEntry * (1 - TP_PCT / 100);
-    sl = side === "long" ? avgEntry * (1 - SL_PCT / 100) : avgEntry * (1 + SL_PCT / 100);
-  }
-
+  // i is signal candle index, entry uses i+1 open
   for (let i = 1; i < candles.length - 1; i++) {
     equityCurve.push({ ts: candles[i].ts, equity });
 
     const c = candles[i];
 
-    // 1) Exit check
+    // 1) manage open position (TP/SL on this bar)
     if (inPos) {
-      // apply slippage on exit price (adverse)
-      // we still use candle high/low to detect hits, but fill at TP/SL adjusted by slippage
       const hitTp = side === "long" ? c.high >= tp : c.low <= tp;
       const hitSl = side === "long" ? c.low <= sl : c.high >= sl;
 
@@ -252,24 +216,30 @@ function runBacktestForSymbol(symbol: string, candles: Candle[], capital: number
       let reason: Trade["reason"] | null = null;
 
       if (hitTp && hitSl) {
-        // Conservative: SL first when both
-        exitPrice = applySlippage(sl, side, false, tickSize);
-        reason = "sl";
+        // both hit: choose rule
+        if (SL_FIRST_IF_BOTH) {
+          exitPrice = sl;
+          reason = "sl";
+        } else {
+          exitPrice = tp;
+          reason = "tp";
+        }
       } else if (hitSl) {
-        exitPrice = applySlippage(sl, side, false, tickSize);
+        exitPrice = sl;
         reason = "sl";
       } else if (hitTp) {
-        exitPrice = applySlippage(tp, side, false, tickSize);
+        exitPrice = tp;
         reason = "tp";
       }
 
       if (reason && exitPrice !== null) {
         const pnlRaw =
           side === "long"
-            ? (exitPrice - avgEntry) * qty
-            : (avgEntry - exitPrice) * qty;
+            ? (exitPrice - entryPrice) * qty
+            : (entryPrice - exitPrice) * qty;
 
-        const fee = avgEntry * qty * feeFracRoundtrip; // approx: roundtrip on entry notional
+        // fee approximation: roundtrip on entry notional
+        const fee = entryPrice * qty * feeFracRoundtrip;
         const pnl = pnlRaw - fee;
 
         equity += pnl;
@@ -278,93 +248,63 @@ function runBacktestForSymbol(symbol: string, candles: Candle[], capital: number
           symbol,
           side,
           entryTs,
-          entryPrice: avgEntry,
+          entryPrice,
           exitTs: c.ts,
           exitPrice,
           reason,
           qty,
           pnl,
-          pnlPct: (pnlRaw / (avgEntry * qty)) * 100 - FEE_ROUNDTRIP_PCT,
-          entries,
+          pnlPct: (pnlRaw / (entryPrice * qty)) * 100 - FEE_ROUNDTRIP_PCT,
         });
 
-        // reset position
         inPos = false;
-        qty = 0;
-        avgEntry = 0;
-        entries = 0;
-        tp = 0;
-        sl = 0;
+        continue;
       }
     }
 
-    // 2) Signal check (close of candle i)
-    if (!Number.isFinite(cvdMa[i - 1]) || !Number.isFinite(cvdMa[i])) continue;
-
-    const longCond = crossedOver(cvd[i - 1], cvdMa[i - 1], cvd[i], cvdMa[i]);
-    const shortCond = crossedUnder(cvd[i - 1], cvdMa[i - 1], cvd[i], cvdMa[i]);
-
-    if (!(longCond || shortCond)) continue;
-
-    const next = candles[i + 1];
-    const sigSide: Side = longCond ? "long" : "short";
-
-    // TradingView pyramiding: allow up to PYRAMIDING entries in same direction
+    // 2) if flat, evaluate signal at candle close i
     if (!inPos) {
-      // open new position
-      side = sigSide;
+      if (!Number.isFinite(cvdMa[i - 1]) || !Number.isFinite(cvdMa[i])) continue;
 
-      const rawEntry = next.open; // enter next open
-      const fillEntry = applySlippage(rawEntry, side, true, tickSize);
+      const longCond = crossedOver(cvd[i - 1], cvdMa[i - 1], cvd[i], cvdMa[i]);
+      const shortCond = crossedUnder(cvd[i - 1], cvdMa[i - 1], cvd[i], cvdMa[i]);
 
-      const q = computeQty(equity, fillEntry);
+      if (longCond || shortCond) {
+        side = longCond ? "long" : "short";
 
-      inPos = true;
-      entryTs = next.ts;
-      avgEntry = fillEntry;
-      qty = q;
-      entries = 1;
-      recomputeTpSl();
-    } else {
-      // already in a position
-      if (sigSide !== side) {
-        // strategy doesn't specify close-on-opposite, so ignore opposite signals
-        continue;
+        // enter next candle open
+        const next = candles[i + 1];
+        entryPrice = next.open;
+        entryTs = next.ts;
+
+        qty = computeQty(equity, entryPrice);
+
+        tp =
+          side === "long"
+            ? entryPrice * (1 + TP_PCT / 100)
+            : entryPrice * (1 - TP_PCT / 100);
+
+        sl =
+          side === "long"
+            ? entryPrice * (1 - SL_PCT / 100)
+            : entryPrice * (1 + SL_PCT / 100);
+
+        inPos = true;
       }
-      if (entries >= PYRAMIDING) {
-        continue;
-      }
-
-      // add entry (pyramiding)
-      const rawEntry = next.open;
-      const fillEntry = applySlippage(rawEntry, side, true, tickSize);
-
-      const addQty = computeQty(equity, fillEntry);
-
-      const newQty = qty + addQty;
-      const newAvg = (avgEntry * qty + fillEntry * addQty) / newQty;
-
-      qty = newQty;
-      avgEntry = newAvg;
-      entries += 1;
-
-      // update TP/SL based on new average entry
-      recomputeTpSl();
     }
   }
 
-  // End of data: if still in position, exit at last close (with slippage)
+  // EOD close if still open
   if (inPos) {
     const last = candles[candles.length - 1];
-    const rawExit = last.close;
-    const exitPrice = applySlippage(rawExit, side, false, tickSize);
+    const exitPrice = last.close;
 
     const pnlRaw =
       side === "long"
-        ? (exitPrice - avgEntry) * qty
-        : (avgEntry - exitPrice) * qty;
+        ? (exitPrice - entryPrice) * qty
+        : (entryPrice - exitPrice) * qty;
 
-    const fee = avgEntry * qty * feeFracRoundtrip;
+    const fee = entryPrice * qty * feeFracRoundtrip;
     const pnl = pnlRaw - fee;
     equity += pnl;
 
@@ -372,14 +312,13 @@ function runBacktestForSymbol(symbol: string, candles: Candle[], capital: number
       symbol,
       side,
       entryTs,
-      entryPrice: avgEntry,
+      entryPrice,
       exitTs: last.ts,
       exitPrice,
       reason: "eod",
       qty,
       pnl,
-      pnlPct: (pnlRaw / (avgEntry * qty)) * 100 - FEE_ROUNDTRIP_PCT,
-      entries,
+      pnlPct: (pnlRaw / (entryPrice * qty)) * 100 - FEE_ROUNDTRIP_PCT,
     });
   }
 
@@ -389,8 +328,8 @@ function runBacktestForSymbol(symbol: string, candles: Candle[], capital: number
   const losses = trades.filter((t) => t.pnl <= 0).length;
   const winRate = trades.length ? (wins / trades.length) * 100 : 0;
 
-  // MDD from equity curve
-  let peak = capital;
+  // max drawdown from equity curve
+  let peak = startEquity;
   let maxDD = 0;
   for (const p of equityCurve) {
     if (p.equity > peak) peak = p.equity;
@@ -398,38 +337,31 @@ function runBacktestForSymbol(symbol: string, candles: Candle[], capital: number
     if (dd > maxDD) maxDD = dd;
   }
 
-  const endEquity = capital + totalPnl;
-  const totalReturnPct = ((endEquity - capital) / capital) * 100;
+  const endEquity = equity;
+  const totalReturnPct = ((endEquity - startEquity) / startEquity) * 100;
 
   return {
+    symbol,
+    skipped: false,
+    reason: null,
     trades,
-    equityCurve,
-    summary: {
-      symbol,
-      candles: candles.length,
-      trades: trades.length,
-      wins,
-      losses,
-      winRatePct: Number(winRate.toFixed(2)),
-      startEquity: Number(capital.toFixed(2)),
-      endEquity: Number(endEquity.toFixed(2)),
-      totalPnl: Number(totalPnl.toFixed(2)),
-      totalReturnPct: Number(totalReturnPct.toFixed(2)),
-      maxDrawdownPct: Number((maxDD * 100).toFixed(2)),
-      feePerSidePct: FEE_PER_SIDE_PCT,
-      slippageTicks: SLIPPAGE_TICKS,
-      pyramiding: PYRAMIDING,
-      tickSize,
-    },
+    startEquity,
+    endEquity,
+    totalPnl,
+    totalReturnPct,
+    maxDrawdownPct: maxDD * 100,
+    winRatePct: winRate,
+    wins,
+    losses,
+    count: trades.length,
   };
 }
 
-// ---------- csv ----------
+// ---------- CSV ----------
 function toCsv(trades: Trade[]) {
   const header = [
     "symbol",
     "side",
-    "entries",
     "entryTs",
     "entryPrice",
     "exitTs",
@@ -444,7 +376,6 @@ function toCsv(trades: Trade[]) {
     [
       t.symbol,
       t.side,
-      t.entries,
       t.entryTs,
       t.entryPrice,
       t.exitTs,
@@ -461,77 +392,81 @@ function toCsv(trades: Trade[]) {
 
 // ---------- main ----------
 async function main() {
-  console.log("[backtest] start", {
+  console.log("[backtest-30m-1y] start", {
     exchange: EXCHANGE,
     timeframe: TIMEFRAME,
-    symbols: SYMBOLS,
     window: `${START_ISO} → ${END_ISO}`,
+    symbols: SYMBOLS,
     cvdLen: CVD_LEN,
     deltaCoef: DELTA_COEF,
     tpPct: TP_PCT,
     slPct: SL_PCT,
-    riskPct: RISK_PCT,
     leverage: LEVERAGE,
+    orderPct: ORDER_PCT,
     initialCapital: INITIAL_CAPITAL,
     equitySplit: EQUITY_SPLIT,
+    binanceFutures: BINANCE_FUTURES,
     feePerSidePct: FEE_PER_SIDE_PCT,
     feeRoundtripPct: FEE_ROUNDTRIP_PCT,
-    slippageTicks: SLIPPAGE_TICKS,
-    pyramiding: PYRAMIDING,
-    futures: BINANCE_FUTURES,
+    slFirstIfBoth: SL_FIRST_IF_BOTH,
   });
 
-  // ccxt for tickSize
-  const ex: any = new ccxt.binance({ enableRateLimit: true });
-  await ex.loadMarkets();
-
-  const perSymbolCapital = EQUITY_SPLIT
+  const perSymbolEquity = EQUITY_SPLIT
     ? INITIAL_CAPITAL / SYMBOLS.length
     : INITIAL_CAPITAL;
 
-  const allTrades: Trade[] = [];
   const summaries: any[] = [];
+  const allTrades: Trade[] = [];
+
   let combinedEndEquity = EQUITY_SPLIT ? 0 : INITIAL_CAPITAL;
 
   for (const symbol of SYMBOLS) {
-    const tickSize = await getTickSize(ex, symbol);
+    const candles = await fetchCandles1y30m(symbol);
+    console.log(`[backtest-30m-1y] ${symbol} candles=${candles.length}`);
 
-    const candles = await fetchCandles1y(symbol);
-    console.log(`[backtest] ${symbol} candles=${candles.length} tickSize=${tickSize}`);
+    const res = backtestSymbol(symbol, candles, perSymbolEquity);
+    summaries.push({
+      symbol: res.symbol,
+      skipped: res.skipped,
+      reason: res.reason,
+      candles: candles.length,
+      trades: res.count,
+      winRatePct: Number(res.winRatePct.toFixed(2)),
+      totalPnl: Number(res.totalPnl.toFixed(2)),
+      startEquity: Number(res.startEquity.toFixed(2)),
+      endEquity: Number(res.endEquity.toFixed(2)),
+      totalReturnPct: Number(res.totalReturnPct.toFixed(2)),
+      maxDrawdownPct: Number(res.maxDrawdownPct.toFixed(2)),
+    });
 
-    const { trades, summary } = runBacktestForSymbol(symbol, candles, perSymbolCapital, tickSize);
-    allTrades.push(...trades);
-    summaries.push(summary);
+    // ✅ only include valid equities in combined sum
+    if (EQUITY_SPLIT) {
+      if (Number.isFinite(res.endEquity)) combinedEndEquity += res.endEquity;
+    } else {
+      if (Number.isFinite(res.endEquity)) combinedEndEquity = res.endEquity;
+    }
 
-    if (EQUITY_SPLIT) combinedEndEquity += summary.endEquity;
-    else combinedEndEquity = summary.endEquity;
+    allTrades.push(...res.trades);
   }
 
-  console.log("\n[backtest] per-symbol summary");
+  console.log("\n[backtest-30m-1y] per-symbol summary");
   for (const s of summaries) console.log(s);
 
-  if (EQUITY_SPLIT) {
-    const totalReturnPct = ((combinedEndEquity - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100;
-    console.log("\n[backtest] combined (equal split) result", {
-      startEquity: INITIAL_CAPITAL,
-      endEquity: Number(combinedEndEquity.toFixed(2)),
-      totalReturnPct: Number(totalReturnPct.toFixed(2)),
-      trades: allTrades.length,
-    });
-  } else {
-    console.log("\n[backtest] combined result (single-symbol mode)", {
-      startEquity: INITIAL_CAPITAL,
-      endEquity: Number(combinedEndEquity.toFixed(2)),
-      trades: allTrades.length,
-    });
-  }
+  const totalReturnPct = ((combinedEndEquity - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100;
 
-  const outPath = `backtest_trades_${TIMEFRAME}_${new Date().toISOString().slice(0, 10)}.csv`;
+  console.log("\n[backtest-30m-1y] combined result", {
+    startEquity: INITIAL_CAPITAL,
+    endEquity: Number(combinedEndEquity.toFixed(2)),
+    totalReturnPct: Number(totalReturnPct.toFixed(2)),
+    trades: allTrades.length,
+  });
+
+  const outPath = `backtest_30m_1y_${new Date().toISOString().slice(0, 10)}.csv`;
   fs.writeFileSync(outPath, toCsv(allTrades), "utf-8");
-  console.log(`\n[backtest] saved trades CSV -> ${outPath}`);
+  console.log(`\n[backtest-30m-1y] saved trades CSV -> ${outPath}`);
 }
 
 main().catch((e) => {
-  console.error("[backtest] fatal:", e?.message ?? e);
+  console.error("[backtest-30m-1y] fatal:", e?.message ?? e);
   process.exit(1);
 });
