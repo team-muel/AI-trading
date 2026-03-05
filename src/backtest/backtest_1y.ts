@@ -119,20 +119,25 @@ function crossedUnder(prevA: number, prevB: number, curA: number, curB: number) 
 // ✅ PostgREST cap 대응: pageSize=1000 고정
 async function fetchCandles1y30m(symbol: string): Promise<Candle[]> {
   const pageSize = 1000;
-  let from = 0;
+  let lastTs: string | null = null;
   const all: Candle[] = [];
 
   while (true) {
-    const { data, error } = await supabase
+    let q = supabase
       .from("candles")
       .select("ts, open, high, low, close, volume")
       .eq("exchange", EXCHANGE)
       .eq("symbol", symbol)
       .eq("timeframe", TIMEFRAME)
-      .gte("ts", START_ISO)
       .lte("ts", END_ISO)
       .order("ts", { ascending: true })
-      .range(from, from + pageSize - 1);
+      .limit(pageSize);
+
+    // Keyset pagination: fetch rows strictly after the last seen timestamp.
+    if (lastTs) q = q.gt("ts", lastTs);
+    else q = q.gte("ts", START_ISO);
+
+    const { data, error } = await q;
 
     if (error) throw error;
 
@@ -150,7 +155,9 @@ async function fetchCandles1y30m(symbol: string): Promise<Candle[]> {
     // 마지막 페이지
     if (rows.length < pageSize) break;
 
-    from += pageSize;
+    const nextLastTs = rows[rows.length - 1]?.ts ?? null;
+    if (!nextLastTs || nextLastTs === lastTs) break;
+    lastTs = nextLastTs;
   }
 
   return all;
@@ -420,8 +427,14 @@ async function main() {
 
   let combinedEndEquity = EQUITY_SPLIT ? 0 : INITIAL_CAPITAL;
 
-  for (const symbol of SYMBOLS) {
-    const candles = await fetchCandles1y30m(symbol);
+  const fetched = await Promise.all(
+    SYMBOLS.map(async (symbol) => {
+      const candles = await fetchCandles1y30m(symbol);
+      return { symbol, candles };
+    })
+  );
+
+  for (const { symbol, candles } of fetched) {
     console.log(`[backtest-30m-1y] ${symbol} candles=${candles.length}`);
 
     const res = backtestSymbol(symbol, candles, perSymbolEquity);
