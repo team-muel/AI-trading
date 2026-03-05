@@ -15,15 +15,31 @@ const SUPABASE_URL = must("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = must("SUPABASE_SERVICE_ROLE_KEY");
 
 const EXCHANGE = (process.env.EXCHANGE ?? "binance").toLowerCase();
-const TIMEFRAME = process.env.TIMEFRAME ?? "30m";
+
 const SYMBOLS = (process.env.SYMBOLS ?? "BTC/USDT")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// ✅ 여러 타임프레임 지원
+const TIMEFRAMES = (process.env.TIMEFRAMES ?? process.env.TIMEFRAME ?? "30m")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 const POLL_SECONDS = Number(process.env.INGEST_POLL_SECONDS ?? 30);
-const BACKFILL_DAYS = Number(process.env.BACKFILL_DAYS ?? 365);
-const MAX_PAGES_PER_SYMBOL = Number(process.env.MAX_PAGES_PER_SYMBOL ?? 200);
+
+// timeframe별 백필/페이지 제한을 다르게 주기 위한 헬퍼
+function getBackfillDays(tf: string) {
+  if (tf === "1m") return Number(process.env.BACKFILL_DAYS_1M ?? 30);
+  if (tf === "30m") return Number(process.env.BACKFILL_DAYS_30M ?? 365);
+  return Number(process.env.BACKFILL_DAYS ?? 60);
+}
+function getMaxPages(tf: string) {
+  if (tf === "1m") return Number(process.env.MAX_PAGES_PER_SYMBOL_1M ?? 200);
+  if (tf === "30m") return Number(process.env.MAX_PAGES_PER_SYMBOL_30M ?? 200);
+  return Number(process.env.MAX_PAGES_PER_SYMBOL ?? 200);
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
@@ -51,7 +67,7 @@ type CandleRow = {
   exchange: string;
   symbol: string;
   timeframe: string;
-  ts: string;
+  ts: string; // ISO
   open: number;
   high: number;
   low: number;
@@ -59,13 +75,13 @@ type CandleRow = {
   volume: number;
 };
 
-async function getLatestTsFromDB(symbol: string): Promise<number | null> {
+async function getLatestTsFromDB(symbol: string, timeframe: string): Promise<number | null> {
   const { data, error } = await supabase
     .from("candles")
     .select("ts")
     .eq("exchange", EXCHANGE)
     .eq("symbol", symbol)
-    .eq("timeframe", TIMEFRAME)
+    .eq("timeframe", timeframe)
     .order("ts", { ascending: false })
     .limit(1);
 
@@ -98,15 +114,20 @@ function makeExchange() {
 function dropUnclosed(ohlcvRaw: ccxt.OHLCV[]): ccxt.OHLCV[] {
   if (!ohlcvRaw || ohlcvRaw.length === 0) return [];
   if (ohlcvRaw.length === 1) return [];
+  // ✅ 마지막 캔들은 미완성일 수 있으니 제거
   return ohlcvRaw.slice(0, -1);
 }
 
-async function ingestSymbol(ex: any, symbol: string) {
-  const tfMs = timeframeToMs(TIMEFRAME);
+async function ingestSymbolTf(ex: any, symbol: string, timeframe: string) {
+  const tfMs = timeframeToMs(timeframe);
   const limit = 1000;
 
-  const latestMs = await getLatestTsFromDB(symbol);
-  const earliestTarget = Date.now() - BACKFILL_DAYS * 24 * 60 * 60 * 1000;
+  const backfillDays = getBackfillDays(timeframe);
+  const maxPages = getMaxPages(timeframe);
+
+  const latestMs = await getLatestTsFromDB(symbol, timeframe);
+
+  const earliestTarget = Date.now() - backfillDays * 24 * 60 * 60 * 1000;
   let since = latestMs ? latestMs + 1 : earliestTarget;
 
   let pages = 0;
@@ -115,7 +136,7 @@ async function ingestSymbol(ex: any, symbol: string) {
   while (true) {
     pages += 1;
 
-    const ohlcvRaw: ccxt.OHLCV[] = await ex.fetchOHLCV(symbol, TIMEFRAME, since, limit);
+    const ohlcvRaw: ccxt.OHLCV[] = await ex.fetchOHLCV(symbol, timeframe, since, limit);
     if (!ohlcvRaw || ohlcvRaw.length === 0) break;
 
     const ohlcv = dropUnclosed(ohlcvRaw);
@@ -126,7 +147,7 @@ async function ingestSymbol(ex: any, symbol: string) {
       return {
         exchange: EXCHANGE,
         symbol,
-        timeframe: TIMEFRAME,
+        timeframe,
         ts: new Date(t).toISOString(),
         open: Number(o),
         high: Number(h),
@@ -143,32 +164,38 @@ async function ingestSymbol(ex: any, symbol: string) {
     const last = rows[rows.length - 1]?.ts;
 
     console.log(
-      `[ingest] ${symbol} page=${pages} fetched=${ohlcvRaw.length} inserted=${rows.length}` +
+      `[ingest] ${symbol} tf=${timeframe} page=${pages} fetched=${ohlcvRaw.length} inserted=${rows.length}` +
         (first && last ? ` range=${first} → ${last}` : "")
     );
 
     const lastMs = new Date(last).getTime();
     since = lastMs + 1;
 
+    // 최신에 거의 도달했으면 종료(2개 봉 여유)
     if (since >= Date.now() - tfMs * 2) break;
-    if (pages >= MAX_PAGES_PER_SYMBOL) break;
 
-    await new Promise((r) => setTimeout(r, 250));
+    // 안전장치
+    if (pages >= maxPages) {
+      console.log(`[ingest] ${symbol} tf=${timeframe} reached maxPages=${maxPages} (stop paging)`);
+      break;
+    }
+
+    await new Promise((r) => setTimeout(r, 200));
   }
 
   if (totalInserted === 0) {
-    console.log(`[ingest] ${symbol} up-to-date (no new closed candles)`);
+    console.log(`[ingest] ${symbol} tf=${timeframe} up-to-date (no new closed candles)`);
   }
 }
 
 async function main() {
   console.log("[ingest] start", {
     exchange: EXCHANGE,
-    timeframe: TIMEFRAME,
     symbols: SYMBOLS,
+    timeframes: TIMEFRAMES,
     pollSeconds: POLL_SECONDS,
-    backfillDays: BACKFILL_DAYS,
-    maxPagesPerSymbol: MAX_PAGES_PER_SYMBOL,
+    backfillDays: Object.fromEntries(TIMEFRAMES.map(tf => [tf, getBackfillDays(tf)])),
+    maxPages: Object.fromEntries(TIMEFRAMES.map(tf => [tf, getMaxPages(tf)])),
   });
 
   const ex = makeExchange();
@@ -176,13 +203,18 @@ async function main() {
 
   while (true) {
     for (const symbol of SYMBOLS) {
-      try {
-        await ingestSymbol(ex, symbol);
-      } catch (e: any) {
-        console.error(`[ingest] ${symbol} error:`, e?.message ?? e);
+      for (const tf of TIMEFRAMES) {
+        try {
+          await ingestSymbolTf(ex, symbol, tf);
+        } catch (e: any) {
+          console.error(`[ingest] ${symbol} tf=${tf} error:`, e?.message ?? e);
+        }
+        // 레이트리밋 완화
+        await new Promise((r) => setTimeout(r, 200));
       }
-      await new Promise((r) => setTimeout(r, 250));
+      await new Promise((r) => setTimeout(r, 200));
     }
+
     await new Promise((r) => setTimeout(r, POLL_SECONDS * 1000));
   }
 }
