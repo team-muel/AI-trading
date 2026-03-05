@@ -10,7 +10,8 @@
     "backtest:tv": "npx tsx src/backtest/backtest_tv_1y.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "tick": "npx tsx src/tick/index.ts"
+    "tick": "npx tsx src/tick/index.ts",
+    "test": "node --test --import tsx"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",

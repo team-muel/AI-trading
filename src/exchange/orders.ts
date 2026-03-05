@@ -177,8 +177,11 @@ export async function placeEntryWithTpSl(params: {
       ? { positionSide: isLong ? "LONG" : "SHORT" }
       : {};
 
+    let tp: any = null;
+    let sl: any = null;
+
     try {
-      const tp = await ex.createOrder(
+      tp = await ex.createOrder(
         symbol,
         "take_profit_market",
         exitSide,
@@ -191,7 +194,7 @@ export async function placeEntryWithTpSl(params: {
         }
       );
 
-      const sl = await ex.createOrder(
+      sl = await ex.createOrder(
         symbol,
         "stop_market",
         exitSide,
@@ -206,6 +209,15 @@ export async function placeEntryWithTpSl(params: {
 
       return { entry, tp, sl, dryRun: false };
     } catch (e: any) {
+      // If TP was created but SL failed, cancel TP first to avoid orphan protection order.
+      try {
+        if (tp?.id) {
+          await ex.cancelOrder(tp.id, symbol);
+        }
+      } catch (cancelErr: any) {
+        console.error("[orders] failed to cancel orphan TP:", cancelErr?.message ?? cancelErr);
+      }
+
       try {
         await emergencyFlattenFutures({
           ex,

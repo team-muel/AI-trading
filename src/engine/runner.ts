@@ -200,6 +200,9 @@ async function runSymbolOnce(symbol: string, tfMs: number) {
     }
     state.lastSignalKey = signalKey;
 
+    // Refresh position state at signal time to avoid stale openPos decisions.
+    openPos = await hasOpenPosition(symbol);
+
     if (openPos) {
       console.log(`[bot] ${symbol} ${side} signal but position already open -> skip`);
       state.lastProcessedTradeMs = t.tsMs;

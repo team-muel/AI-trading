@@ -14,21 +14,28 @@ export async function fetchTicksSince(params: {
   limit: number;
   maxPages: number;
 }) {
-  let from = 0;
+  let cursorId = 0;
   let pages = 0;
   const all: SupabaseTradeTick[] = [];
+  const startIso = new Date(Math.max(0, params.sinceMs - 1000)).toISOString();
 
   while (pages < params.maxPages) {
     pages += 1;
 
-    const { data, error } = await supabase
+    let q = supabase
       .from("trade_ticks")
-      .select("ts, price, qty, exchange_trade_id")
+      .select("id, ts, price, qty, exchange_trade_id")
       .eq("exchange", config.exchange)
       .eq("symbol", params.symbol)
-      .gte("ts", new Date(Math.max(0, params.sinceMs - 1000)).toISOString())
-      .order("ts", { ascending: true })
-      .range(from, from + params.limit - 1);
+      .gte("ts", startIso)
+      .order("id", { ascending: true })
+      .limit(params.limit);
+
+    if (cursorId > 0) {
+      q = q.gt("id", cursorId);
+    }
+
+    const { data, error } = await q;
 
     if (error) throw error;
 
@@ -51,8 +58,12 @@ export async function fetchTicksSince(params: {
 
     all.push(...rows);
 
+    const lastId = Number((data as any[])[(data as any[]).length - 1]?.id ?? 0);
+    if (Number.isFinite(lastId) && lastId > 0) {
+      cursorId = lastId;
+    }
+
     if (rows.length < params.limit) break;
-    from += params.limit;
   }
 
   const dedup = new Map<string, SupabaseTradeTick>();
