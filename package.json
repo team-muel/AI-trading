@@ -1,0 +1,26 @@
+{
+  "name": "AI-trading",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "npx tsx src/index.ts",
+    "ingest": "npx tsx src/ingest/binance_to_supabase.ts",
+    "backtest": "npx tsx src/backtest/backtest_1y.ts",
+    "backtest:tv": "npx tsx src/backtest/backtest_tv_1y.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "tick": "npx tsx src/tick/index.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "ccxt": "^4.4.0",
+    "dotenv": "^16.4.5",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.6.3"
+  }
+}
