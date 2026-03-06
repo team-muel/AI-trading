@@ -5,3 +5,4 @@ dist
 .cache/
 *.log
 backtest_*.csv
+data/

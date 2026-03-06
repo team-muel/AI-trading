@@ -1,34 +1,30 @@
 import "dotenv/config";
+import fs from "fs";
+import path from "path";
+import { once } from "events";
 import WebSocket from "ws";
-import { createClient } from "@supabase/supabase-js";
 
-function must(k: string) {
-  const v = process.env[k];
-  if (!v) throw new Error(`Missing env: ${k}`);
-  return v;
-}
-
-const SUPABASE_URL = must("SUPABASE_URL");
-const SUPABASE_SERVICE_ROLE_KEY = must("SUPABASE_SERVICE_ROLE_KEY");
 const EXCHANGE = (process.env.EXCHANGE ?? "binance").toLowerCase();
 const BINANCE_FUTURES = (process.env.BINANCE_FUTURES ?? "true") === "true";
-
 const SYMBOLS = (process.env.SYMBOLS ?? "BTC/USDT")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const FLUSH_EVERY_MS = Number(process.env.TICK_FLUSH_MS ?? 1500);
+const RAW_ROOT = process.env.TICK_RAW_DIR ?? path.join("data", "raw");
+const FLUSH_EVERY_MS = Number(process.env.TICK_FLUSH_MS ?? 1000);
 const FLUSH_BATCH_SIZE = Number(process.env.TICK_FLUSH_BATCH ?? 1000);
+const rawMaxMb = Number(process.env.TICK_RAW_MAX_FILE_MB ?? 128);
+const MAX_FILE_BYTES = Math.max(1, Math.floor(rawMaxMb * 1024 * 1024));
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false },
-});
-
-type TickRow = {
+type TickEvent = {
   exchange: string;
   symbol: string;
-  ts: string;
+  market_id: string;
+  ts_ms: number;
+  ts_iso: string;
+  date: string;
+  hour: string;
   exchange_trade_id: string;
   price: number;
   qty: number;
@@ -43,19 +39,130 @@ function toStreamName(symbol: string) {
   return toMarketId(symbol).toLowerCase();
 }
 
-async function upsertTicks(rows: TickRow[]) {
+function ensureDir(p: string) {
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+
+function symbolDirName(symbol: string) {
+  return symbol.replace(/[/:]/g, "_");
+}
+
+function pad2(n: number) {
+  return String(n).padStart(2, "0");
+}
+
+function getDateHour(tsMs: number) {
+  const d = new Date(tsMs);
+  const y = d.getUTCFullYear();
+  const m = pad2(d.getUTCMonth() + 1);
+  const day = pad2(d.getUTCDate());
+  const h = pad2(d.getUTCHours());
+  return {
+    date: `${y}-${m}-${day}`,
+    hour: h,
+  };
+}
+
+type Writer = {
+  partitionKey: string;
+  dir: string;
+  filePath: string;
+  stream: fs.WriteStream;
+  bytes: number;
+};
+
+const writers = new Map<string, Writer>();
+
+function buildPartitionDir(symbol: string, date: string, hour: string) {
+  return path.join(RAW_ROOT, `symbol=${symbolDirName(symbol)}`, `date=${date}`, `hour=${hour}`);
+}
+
+function nextPartPath(dir: string) {
+  ensureDir(dir);
+
+  const parts = fs
+    .readdirSync(dir)
+    .filter((f) => f.endsWith(".ndjson") && f.startsWith("part-"))
+    .map((f) => {
+      const m = /^part-(\d+)\.ndjson$/.exec(f);
+      if (!m) return null;
+      return { name: f, idx: Number(m[1]) };
+    })
+    .filter((x): x is { name: string; idx: number } => !!x && Number.isFinite(x.idx))
+    .sort((a, b) => a.idx - b.idx);
+
+  if (parts.length === 0) return path.join(dir, "part-000.ndjson");
+
+  const latest = parts[parts.length - 1];
+  const latestPath = path.join(dir, latest.name);
+  const st = fs.statSync(latestPath);
+  if (st.size < MAX_FILE_BYTES) return latestPath;
+
+  const next = latest.idx + 1;
+  return path.join(dir, `part-${String(next).padStart(3, "0")}.ndjson`);
+}
+
+function getWriter(symbol: string, date: string, hour: string) {
+  const partitionKey = `${symbol}|${date}|${hour}`;
+  const existing = writers.get(partitionKey);
+  if (existing) return existing;
+
+  const dir = buildPartitionDir(symbol, date, hour);
+  const filePath = nextPartPath(dir);
+  const bytes = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+
+  const stream = fs.createWriteStream(filePath, { flags: "a" });
+  const writer: Writer = { partitionKey, dir, filePath, stream, bytes };
+  writers.set(partitionKey, writer);
+  return writer;
+}
+
+async function endWriterStream(stream: fs.WriteStream) {
+  await new Promise<void>((resolve, reject) => {
+    stream.once("error", reject);
+    stream.end(() => resolve());
+  });
+}
+
+async function writeLine(writer: Writer, line: string) {
+  const ok = writer.stream.write(line);
+  writer.bytes += Buffer.byteLength(line);
+  if (!ok) {
+    await once(writer.stream, "drain");
+  }
+}
+
+async function rotateWriterIfNeeded(w: Writer) {
+  if (w.bytes < MAX_FILE_BYTES) return w;
+
+  await endWriterStream(w.stream);
+  const filePath = nextPartPath(w.dir);
+  const stream = fs.createWriteStream(filePath, { flags: "a" });
+  const next: Writer = {
+    partitionKey: w.partitionKey,
+    dir: w.dir,
+    filePath,
+    stream,
+    bytes: fs.existsSync(filePath) ? fs.statSync(filePath).size : 0,
+  };
+  writers.set(w.partitionKey, next);
+  return next;
+}
+
+async function flushToDisk(rows: TickEvent[]) {
   if (rows.length === 0) return;
 
-  for (let i = 0; i < rows.length; i += FLUSH_BATCH_SIZE) {
-    const batch = rows.slice(i, i + FLUSH_BATCH_SIZE);
-    const { error } = await supabase
-      .from("trade_ticks")
-      .upsert(batch, { onConflict: "exchange,symbol,exchange_trade_id" });
-    if (error) throw error;
+  for (const row of rows) {
+    const writer0 = getWriter(row.symbol, row.date, row.hour);
+    const writer = await rotateWriterIfNeeded(writer0);
+    const line = JSON.stringify(row) + "\n";
+    await writeLine(writer, line);
   }
 }
 
 async function main() {
+  ensureDir(RAW_ROOT);
+
   const marketIdToSymbol = new Map<string, string>();
   for (const s of SYMBOLS) {
     marketIdToSymbol.set(toMarketId(s), s);
@@ -71,16 +178,26 @@ async function main() {
   let isClosing = false;
   let reconnectTimer: NodeJS.Timeout | null = null;
 
-  const buf: TickRow[] = [];
+  const buf: TickEvent[] = [];
   let flushing = false;
+  let flushQueued = false;
 
   const flush = async () => {
-    if (flushing || buf.length === 0) return;
+    if (flushing) {
+      flushQueued = true;
+      return;
+    }
+
     flushing = true;
     try {
-      const rows = buf.splice(0, buf.length);
-      await upsertTicks(rows);
-      console.log(`[tick] flushed rows=${rows.length}`);
+      do {
+        flushQueued = false;
+        if (buf.length === 0) break;
+
+        const rows = buf.splice(0, buf.length);
+        await flushToDisk(rows);
+        console.log(`[tick] flushed rows=${rows.length}`);
+      } while (flushQueued);
     } catch (e: any) {
       console.error("[tick] flush error:", e?.message ?? e);
     } finally {
@@ -120,10 +237,16 @@ async function main() {
           return;
         }
 
+        const { date, hour } = getDateHour(tsMs);
+
         buf.push({
           exchange: EXCHANGE,
           symbol,
-          ts: new Date(tsMs).toISOString(),
+          market_id: marketId,
+          ts_ms: tsMs,
+          ts_iso: new Date(tsMs).toISOString(),
+          date,
+          hour,
           exchange_trade_id: tradeId,
           price,
           qty,
@@ -161,6 +284,9 @@ async function main() {
     }
 
     await flush();
+    for (const w of writers.values()) {
+      await endWriterStream(w.stream);
+    }
     console.log("[tick] shutdown complete");
     process.exit(0);
   };

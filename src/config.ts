@@ -1,5 +1,4 @@
 import "dotenv/config";
-import { parseRunnerTickSource } from "./engine/tickSource";
 
 function must(k: string) {
   const v = process.env[k];
@@ -48,7 +47,6 @@ export const config = {
   // Runner
   pollSeconds: Number(process.env.POLL_SECONDS ?? 20),
   candleLookback: Number(process.env.CANDLE_LOOKBACK ?? 400),
-  runnerTickSource: parseRunnerTickSource(process.env.RUNNER_TICK_SOURCE),
 
   // Safety
   dryRun: (process.env.DRY_RUN ?? "true") === "true",

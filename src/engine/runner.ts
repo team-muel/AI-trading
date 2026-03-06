@@ -8,7 +8,6 @@ import { sizeByExposure } from "../strategy/sizing";
 import { placeEntryWithTpSl } from "../exchange/orders";
 import { hasOpenPosition } from "../exchange/position";
 import { fetchTradesSince } from "../exchange/trades";
-import { fetchTicksSince } from "../supabase/ticks";
 import { insertTrade } from "../supabase/trades";
 
 type TickBar = {
@@ -148,22 +147,13 @@ async function runSymbolOnce(symbol: string, tfMs: number) {
   const tickFetchLimit = Number(process.env.TICK_FETCH_LIMIT ?? 1000);
   const tickMaxPages = Number(process.env.TICK_MAX_PAGES ?? 3);
 
-  const source = config.runnerTickSource;
-  const ticks =
-    source === "binance"
-      ? await fetchTradesSince({
-          symbol,
-          sinceMs: state.lastProcessedTradeMs + 1,
-          futures: config.binanceFutures,
-          limit: tickFetchLimit,
-          maxPages: tickMaxPages,
-        })
-      : await fetchTicksSince({
-          symbol,
-          sinceMs: state.lastProcessedTradeMs + 1,
-          limit: tickFetchLimit,
-          maxPages: tickMaxPages,
-        });
+  const ticks = await fetchTradesSince({
+    symbol,
+    sinceMs: state.lastProcessedTradeMs + 1,
+    futures: config.binanceFutures,
+    limit: tickFetchLimit,
+    maxPages: tickMaxPages,
+  });
 
   if (ticks.length === 0) return;
 

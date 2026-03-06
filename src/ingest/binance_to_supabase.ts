@@ -30,10 +30,6 @@ const TIMEFRAMES = (process.env.TIMEFRAMES ?? process.env.TIMEFRAME ?? "30m")
 
 const POLL_SECONDS = Number(process.env.INGEST_POLL_SECONDS ?? 30);
 const BINANCE_FUTURES = (process.env.BINANCE_FUTURES ?? "true") === "true";
-const INGEST_TICKS = (process.env.INGEST_TICKS ?? "true") === "true";
-const INGEST_TICK_BACKFILL_MINUTES = Number(process.env.INGEST_TICK_BACKFILL_MINUTES ?? 180);
-const INGEST_TICK_LIMIT = Number(process.env.INGEST_TICK_LIMIT ?? 1000);
-const INGEST_TICK_MAX_PAGES = Number(process.env.INGEST_TICK_MAX_PAGES ?? 10);
 
 // timeframe별 백필/페이지 제한을 다르게 주기 위한 헬퍼
 function getBackfillDays(tf: string) {
@@ -83,16 +79,6 @@ type CandleRow = {
 
 type OHLCV = [number, number, number, number, number, number];
 
-type TradeTickRow = {
-  exchange: string;
-  symbol: string;
-  ts: string;
-  exchange_trade_id: string;
-  price: number;
-  qty: number;
-  side: string | null;
-};
-
 async function getLatestTsFromDB(symbol: string, timeframe: string): Promise<number | null> {
   const { data, error } = await supabase
     .from("candles")
@@ -113,28 +99,6 @@ async function upsertCandles(rows: CandleRow[]) {
   const { error } = await supabase
     .from("candles")
     .upsert(rows, { onConflict: "exchange,symbol,timeframe,ts" });
-  if (error) throw error;
-}
-
-async function getLatestTickTsFromDB(symbol: string): Promise<number | null> {
-  const { data, error } = await supabase
-    .from("trade_ticks")
-    .select("ts")
-    .eq("exchange", EXCHANGE)
-    .eq("symbol", symbol)
-    .order("ts", { ascending: false })
-    .limit(1);
-
-  if (error) throw error;
-  const ts = data?.[0]?.ts as string | undefined;
-  return ts ? new Date(ts).getTime() : null;
-}
-
-async function upsertTradeTicks(rows: TradeTickRow[]) {
-  if (rows.length === 0) return;
-  const { error } = await supabase
-    .from("trade_ticks")
-    .upsert(rows, { onConflict: "exchange,symbol,exchange_trade_id" });
   if (error) throw error;
 }
 
@@ -229,73 +193,6 @@ async function ingestSymbolTf(ex: any, symbol: string, timeframe: string) {
   }
 }
 
-async function ingestSymbolTicks(ex: any, symbol: string) {
-  const apiSymbol = toBinanceSymbol(symbol, BINANCE_FUTURES);
-  const latestMs = await getLatestTickTsFromDB(symbol);
-
-  let since = latestMs
-    ? Math.max(0, latestMs - 1000)
-    : Date.now() - INGEST_TICK_BACKFILL_MINUTES * 60 * 1000;
-
-  let lastTradeId: number | null = null;
-  let pages = 0;
-  let inserted = 0;
-
-  while (pages < INGEST_TICK_MAX_PAGES) {
-    pages += 1;
-
-    const fetchParams: Record<string, string> | undefined =
-      lastTradeId !== null ? { fromId: String(lastTradeId + 1) } : undefined;
-
-    const rows: any[] = await ex.fetchTrades(apiSymbol, since, INGEST_TICK_LIMIT, fetchParams);
-    if (!rows || rows.length === 0) break;
-
-    const mapped: TradeTickRow[] = [];
-    for (const r of rows as any[]) {
-      const tsMs = Number((r as any)?.timestamp ?? 0);
-      const tradeIdRaw: unknown = (r as any)?.id;
-      const tradeId: string | undefined = tradeIdRaw != null ? String(tradeIdRaw) : undefined;
-      const price = Number((r as any)?.price);
-      const qty = Number((r as any)?.amount ?? 0);
-      const sideRaw = (r as any)?.side;
-      const side = sideRaw === "buy" || sideRaw === "sell" ? sideRaw : null;
-
-      if (!tradeId) continue;
-      if (!Number.isFinite(tsMs) || !Number.isFinite(price) || !Number.isFinite(qty)) continue;
-
-      mapped.push({
-        exchange: EXCHANGE,
-        symbol,
-        ts: new Date(tsMs).toISOString(),
-        exchange_trade_id: tradeId,
-        price,
-        qty,
-        side,
-      });
-
-      const idNum: number = Number(tradeId);
-      if (Number.isFinite(idNum)) {
-        lastTradeId = lastTradeId === null ? idNum : Math.max(lastTradeId, idNum);
-      }
-    }
-
-    await upsertTradeTicks(mapped);
-    inserted += mapped.length;
-
-    const lastTs = Number((rows[rows.length - 1] as any)?.timestamp ?? 0);
-    if (!Number.isFinite(lastTs) || lastTs <= 0) break;
-
-    since = lastTs + 1;
-    if (rows.length < INGEST_TICK_LIMIT) break;
-
-    await new Promise((r) => setTimeout(r, 120));
-  }
-
-  if (inserted > 0) {
-    console.log(`[ingest] ${symbol} ticks inserted=${inserted} pages=${pages}`);
-  }
-}
-
 async function main() {
   console.log("[ingest] start", {
     exchange: EXCHANGE,
@@ -304,9 +201,6 @@ async function main() {
     pollSeconds: POLL_SECONDS,
     backfillDays: Object.fromEntries(TIMEFRAMES.map(tf => [tf, getBackfillDays(tf)])),
     maxPages: Object.fromEntries(TIMEFRAMES.map(tf => [tf, getMaxPages(tf)])),
-    ingestTicks: INGEST_TICKS,
-    ingestTickLimit: INGEST_TICK_LIMIT,
-    ingestTickMaxPages: INGEST_TICK_MAX_PAGES,
   });
 
   const ex = makeExchange();
@@ -323,15 +217,6 @@ async function main() {
         // 레이트리밋 완화
         await new Promise((r) => setTimeout(r, 200));
       }
-
-      if (INGEST_TICKS) {
-        try {
-          await ingestSymbolTicks(ex, symbol);
-        } catch (e: any) {
-          console.error(`[ingest] ${symbol} ticks error:`, e?.message ?? e);
-        }
-      }
-
       await new Promise((r) => setTimeout(r, 200));
     }
 

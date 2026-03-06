@@ -1,17 +1,9 @@
 import "dotenv/config";
 import fs from "fs";
 import ccxt from "ccxt";
-import { createClient } from "@supabase/supabase-js";
 import { toBinanceSymbol } from "../exchange/symbol";
+import { runDuckdbSql, sqlString } from "../tick/duckdb_cli";
 
-function must(k: string) {
-  const v = process.env[k];
-  if (!v) throw new Error(`Missing env: ${k}`);
-  return v;
-}
-
-const SUPABASE_URL = must("SUPABASE_URL");
-const SUPABASE_SERVICE_ROLE_KEY = must("SUPABASE_SERVICE_ROLE_KEY");
 const EXCHANGE = (process.env.EXCHANGE ?? "binance").toLowerCase();
 const SYMBOLS = (process.env.SYMBOLS ?? "BTC/USDT").split(",").map((s) => s.trim()).filter(Boolean);
 
@@ -36,13 +28,16 @@ const END_MS = process.env.BT_END ? new Date(process.env.BT_END).getTime() : Dat
 const START_MS = process.env.BT_START
   ? new Date(process.env.BT_START).getTime()
   : END_MS - 365 * 24 * 60 * 60 * 1000;
-const START_ISO = new Date(START_MS).toISOString();
-const END_ISO = new Date(END_MS).toISOString();
 
+const PARQUET_GLOB = process.env.BT_PARQUET_GLOB ?? "data/parquet/**/*.parquet";
+const DUCKDB_FILE = process.env.BT_DUCKDB_FILE ?? "data/backtest.duckdb";
 const CHUNK_SIZE = Number(process.env.BT_CHUNK_SIZE ?? 50000);
 const MAX_CHUNKS = Number(process.env.BT_MAX_CHUNKS ?? 5000);
 
-type Tick = { id: number; tsMs: number; price: number; amount: number };
+// Optional SQL prelude for remote reads (for example: INSTALL httpfs; LOAD httpfs; ...)
+const DUCKDB_INIT_SQL = process.env.BT_DUCKDB_INIT_SQL ?? "";
+
+type Tick = { tsMs: number; price: number; amount: number; tradeId: number };
 type Side = "long" | "short";
 
 type Trade = {
@@ -58,10 +53,6 @@ type Trade = {
   pnl: number;
   pnlPct: number;
 };
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false },
-});
 
 function sma(series: number[], len: number) {
   const out = new Array(series.length).fill(Number.NaN);
@@ -93,13 +84,8 @@ function applySlippage(price: number, side: Side, isEntry: boolean, tickSize: nu
   return side === "long" ? price - slip : price + slip;
 }
 
-function leverageForSide() {
-  return LEVERAGE;
-}
-
-function computeQtyTv(equity: number, price: number, _side: Side) {
-  const effectiveLeverage = leverageForSide();
-  const notional = equity * (ORDER_PCT / 100) * effectiveLeverage;
+function computeQtyTv(equity: number, price: number) {
+  const notional = equity * (ORDER_PCT / 100) * LEVERAGE;
   return notional / price;
 }
 
@@ -116,33 +102,72 @@ async function getTickSize(ex: any, symbol: string): Promise<number> {
   } catch {
     // ignore
   }
+
   const p = m?.precision?.price;
   if (typeof p === "number" && Number.isFinite(p)) return 1 / Math.pow(10, p);
   return 0.01;
 }
 
-async function fetchTickChunk(symbol: string, cursorId: number) {
-  let q = supabase
-    .from("trade_ticks")
-    .select("id, ts, price, qty")
-    .eq("exchange", EXCHANGE)
-    .eq("symbol", symbol)
-    .gte("ts", START_ISO)
-    .lte("ts", END_ISO)
-    .order("id", { ascending: true })
-    .limit(CHUNK_SIZE);
+function csvToTicks(csv: string): Tick[] {
+  if (!csv.trim()) return [];
 
-  if (cursorId > 0) q = q.gt("id", cursorId);
+  const rows = csv.split(/\r?\n/).filter(Boolean);
+  const out: Tick[] = [];
 
-  const { data, error } = await q;
-  if (error) throw error;
+  for (const row of rows) {
+    const p = row.split(",");
+    if (p.length < 4) continue;
 
-  return (data ?? []).map((r: any) => ({
-    id: Number(r.id),
-    tsMs: new Date(String(r.ts)).getTime(),
-    price: Number(r.price),
-    amount: Number(r.qty),
-  })) as Tick[];
+    const tsMs = Number(p[0]);
+    const price = Number(p[1]);
+    const amount = Number(p[2]);
+    const tradeId = Number(p[3]);
+
+    if (!Number.isFinite(tsMs) || !Number.isFinite(price) || !Number.isFinite(amount) || !Number.isFinite(tradeId)) {
+      continue;
+    }
+
+    out.push({ tsMs, price, amount, tradeId });
+  }
+
+  return out;
+}
+
+function fetchTickChunk(symbol: string, cursorTsMs: number, cursorTradeId: number) {
+  const whereCursor =
+    cursorTsMs <= 0
+      ? ""
+      : `AND (ts_ms > ${cursorTsMs} OR (ts_ms = ${cursorTsMs} AND trade_id > ${cursorTradeId}))`;
+
+  const sql = `
+    ${DUCKDB_INIT_SQL}
+    COPY (
+      SELECT
+        ts_ms,
+        price,
+        qty,
+        trade_id
+      FROM (
+        SELECT
+          ts_ms,
+          price,
+          qty,
+          TRY_CAST(exchange_trade_id AS BIGINT) AS trade_id
+        FROM read_parquet(${sqlString(PARQUET_GLOB)}, hive_partitioning = 1)
+        WHERE exchange = ${sqlString(EXCHANGE)}
+          AND symbol = ${sqlString(symbol)}
+          AND ts_ms >= ${START_MS}
+          AND ts_ms <= ${END_MS}
+      ) t
+      WHERE trade_id IS NOT NULL
+        ${whereCursor}
+      ORDER BY ts_ms, trade_id
+      LIMIT ${CHUNK_SIZE}
+    ) TO STDOUT (FORMAT CSV, HEADER FALSE);
+  `;
+
+  const { stdout } = runDuckdbSql({ databasePath: DUCKDB_FILE, sql });
+  return csvToTicks(stdout);
 }
 
 function toCsv(trades: Trade[]) {
@@ -182,9 +207,11 @@ function toCsv(trades: Trade[]) {
 async function runSymbolChunked(symbol: string, tickSize: number, capital: number) {
   const trades: Trade[] = [];
   let equity = capital;
-  let cursor = 0;
   let chunks = 0;
   let ticksProcessed = 0;
+
+  let cursorTsMs = 0;
+  let cursorTradeId = 0;
 
   let inPos = false;
   let side: Side = "long";
@@ -200,8 +227,6 @@ async function runSymbolChunked(symbol: string, tickSize: number, capital: numbe
   const tfMinutes = 30;
   let curBarStartMs: number | null = null;
   let curOpen = 0,
-    curHigh = -Infinity,
-    curLow = Infinity,
     curClose = 0,
     curVol = 0;
 
@@ -215,11 +240,13 @@ async function runSymbolChunked(symbol: string, tickSize: number, capital: numbe
 
   while (chunks < MAX_CHUNKS) {
     chunks += 1;
-    const ticks = await fetchTickChunk(symbol, cursor);
+    const ticks = fetchTickChunk(symbol, cursorTsMs, cursorTradeId);
     if (ticks.length === 0) break;
 
     ticksProcessed += ticks.length;
-    cursor = ticks[ticks.length - 1].id;
+    const last = ticks[ticks.length - 1];
+    cursorTsMs = last.tsMs;
+    cursorTradeId = last.tradeId;
 
     for (const t of ticks) {
       lastTick = t;
@@ -234,13 +261,9 @@ async function runSymbolChunked(symbol: string, tickSize: number, capital: numbe
 
         curBarStartMs = barStartMs;
         curOpen = t.price;
-        curHigh = t.price;
-        curLow = t.price;
         curClose = t.price;
         curVol = t.amount;
       } else {
-        curHigh = Math.max(curHigh, t.price);
-        curLow = Math.min(curLow, t.price);
         curClose = t.price;
         curVol += t.amount;
       }
@@ -306,7 +329,7 @@ async function runSymbolChunked(symbol: string, tickSize: number, capital: numbe
       if (!inPos) {
         side = sigSide;
         const entryPrice = applySlippage(t.price, side, true, tickSize);
-        const q = computeQtyTv(equity, entryPrice, side);
+        const q = computeQtyTv(equity, entryPrice);
 
         inPos = true;
         entryTs = new Date(t.tsMs).toISOString();
@@ -319,7 +342,7 @@ async function runSymbolChunked(symbol: string, tickSize: number, capital: numbe
         if (entries >= PYRAMIDING) continue;
 
         const entryPrice = applySlippage(t.price, side, true, tickSize);
-        const addQty = computeQtyTv(equity, entryPrice, side);
+        const addQty = computeQtyTv(equity, entryPrice);
 
         const newQty = qty + addQty;
         avgEntry = (avgEntry * qty + entryPrice * addQty) / newQty;
@@ -362,16 +385,20 @@ async function runSymbolChunked(symbol: string, tickSize: number, capital: numbe
 }
 
 async function main() {
-  console.log("[backtest-tv-chunked] start", {
+  console.log("[backtest-tv-parquet] start", {
     exchange: EXCHANGE,
     symbols: SYMBOLS,
-    window: `${START_ISO} -> ${END_ISO}`,
+    parquetGlob: PARQUET_GLOB,
+    window: `${new Date(START_MS).toISOString()} -> ${new Date(END_MS).toISOString()}`,
     chunkSize: CHUNK_SIZE,
     maxChunks: MAX_CHUNKS,
     futures: BINANCE_FUTURES,
   });
 
-  const ex: any = new ccxt.binance({ enableRateLimit: true, options: { defaultType: BINANCE_FUTURES ? "future" : "spot" } });
+  const ex: any = new ccxt.binance({
+    enableRateLimit: true,
+    options: { defaultType: BINANCE_FUTURES ? "future" : "spot" },
+  });
   await ex.loadMarkets();
 
   const perSymbolCapital = EQUITY_SPLIT ? INITIAL_CAPITAL / SYMBOLS.length : INITIAL_CAPITAL;
@@ -389,23 +416,25 @@ async function main() {
     if (EQUITY_SPLIT) combinedEnd += res.endEquity;
     else combinedEnd = res.endEquity;
 
-    console.log(`[backtest-tv-chunked] ${symbol} ticks=${res.ticksProcessed} chunks=${res.chunks} trades=${res.trades.length} endEquity=${res.endEquity.toFixed(2)}`);
+    console.log(
+      `[backtest-tv-parquet] ${symbol} ticks=${res.ticksProcessed} chunks=${res.chunks} trades=${res.trades.length} endEquity=${res.endEquity.toFixed(2)}`
+    );
   }
 
   const totalReturnPct = ((combinedEnd - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100;
-  console.log("[backtest-tv-chunked] combined", {
+  console.log("[backtest-tv-parquet] combined", {
     startEquity: INITIAL_CAPITAL,
     endEquity: Number(combinedEnd.toFixed(2)),
     totalReturnPct: Number(totalReturnPct.toFixed(2)),
     trades: allTrades.length,
   });
 
-  const outPath = `backtest_tv_chunked_30m_${new Date().toISOString().slice(0, 10)}.csv`;
+  const outPath = `backtest_tv_parquet_30m_${new Date().toISOString().slice(0, 10)}.csv`;
   fs.writeFileSync(outPath, toCsv(allTrades), "utf-8");
-  console.log(`[backtest-tv-chunked] saved CSV -> ${outPath}`);
+  console.log(`[backtest-tv-parquet] saved CSV -> ${outPath}`);
 }
 
 main().catch((e) => {
-  console.error("[backtest-tv-chunked] fatal:", e?.message ?? e);
+  console.error("[backtest-tv-parquet] fatal:", e?.message ?? e);
   process.exit(1);
 });

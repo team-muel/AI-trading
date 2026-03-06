@@ -6,13 +6,15 @@
   "scripts": {
     "dev": "npx tsx src/index.ts",
     "ingest": "npx tsx src/ingest/binance_to_supabase.ts",
-    "ingest:aggdump": "npx tsx src/tick/backfill_aggtrades_dump.ts",
+    "tick:collect": "npx tsx src/tick/index.ts",
+    "tick:convert": "npx tsx src/tick/convert_ndjson_to_parquet.ts",
+    "tick:upload": "npx tsx src/tick/upload_parquet_gcs.ts",
     "backtest": "npx tsx src/backtest/backtest_1y.ts",
     "backtest:tv": "npx tsx src/backtest/backtest_tv_1y.ts",
-    "backtest:tv:chunked": "npx tsx src/backtest/backtest_tv_chunked.ts",
+    "backtest:tv:parquet": "npx tsx src/backtest/backtest_tv_parquet.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "tick": "npx tsx src/tick/index.ts",
+    "tick": "npm run tick:collect",
     "test": "node --test --import tsx"
   },
   "dependencies": {
@@ -22,9 +24,7 @@
     "ws": "^8.19.0"
   },
   "devDependencies": {
-    "@types/adm-zip": "^0.5.7",
     "@types/ws": "^8.18.1",
-    "adm-zip": "^0.5.16",
     "tsx": "^4.21.0",
     "typescript": "^5.6.3"
   }
