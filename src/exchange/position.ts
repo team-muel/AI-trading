@@ -15,8 +15,37 @@ function getBaseAsset(ex: any, symbol: string): string {
 }
 
 export async function hasOpenPosition(symbol: string): Promise<boolean> {
-  // 드라이런에서는 포지션 체크 생략
-  if (config.dryRun) return false;
+  const snapshot = await getPositionSnapshot(symbol);
+  return snapshot.open;
+}
+
+export async function getPositionSnapshot(symbol: string): Promise<{
+  symbol: string;
+  exchangeSymbol: string;
+  marketType: "futures" | "spot";
+  open: boolean;
+  side: "long" | "short" | "flat";
+  qty: number;
+  entryPrice?: number | null;
+  markPrice?: number | null;
+  dryRun: boolean;
+  raw?: Record<string, unknown> | null;
+}> {
+  // DRY_RUN에서는 실제 주문/포지션 조회를 하지 않는다.
+  if (config.dryRun) {
+    return {
+      symbol,
+      exchangeSymbol: toBinanceSymbol(symbol, config.binanceFutures),
+      marketType: config.binanceFutures ? "futures" : "spot",
+      open: false,
+      side: "flat",
+      qty: 0,
+      entryPrice: null,
+      markPrice: null,
+      dryRun: true,
+      raw: null,
+    };
+  }
 
   const ex: any = makeBinance();
   await ex.loadMarkets();
@@ -33,7 +62,20 @@ export async function hasOpenPosition(symbol: string): Promise<boolean> {
         ((Number.isFinite(free) ? free : 0) + (Number.isFinite(used) ? used : 0))
     );
 
-    return Number.isFinite(total) && total > config.binanceSpotMinBaseQty;
+    const qty = Number.isFinite(total) ? total : 0;
+    const open = qty > config.binanceSpotMinBaseQty;
+    return {
+      symbol,
+      exchangeSymbol: apiSymbol,
+      marketType: "spot",
+      open,
+      side: open ? "long" : "flat",
+      qty,
+      entryPrice: null,
+      markPrice: null,
+      dryRun: false,
+      raw: null,
+    };
   }
 
   const apiSymbol = toBinanceSymbol(symbol, true);
@@ -46,6 +88,22 @@ export async function hasOpenPosition(symbol: string): Promise<boolean> {
     (x: any) => candidates.has(x?.symbol) || candidates.has(x?.info?.symbol)
   );
 
-  const amt = Number(p?.info?.positionAmt ?? 0);
-  return Number.isFinite(amt) && Math.abs(amt) > 0;
+  const amt = Number(p?.info?.positionAmt ?? p?.contracts ?? 0);
+  const absAmt = Number.isFinite(amt) ? Math.abs(amt) : 0;
+  const open = absAmt > 0;
+  const entryPrice = Number(p?.info?.entryPrice ?? p?.entryPrice ?? Number.NaN);
+  const markPrice = Number(p?.info?.markPrice ?? p?.markPrice ?? Number.NaN);
+
+  return {
+    symbol,
+    exchangeSymbol: apiSymbol,
+    marketType: "futures",
+    open,
+    side: !open ? "flat" : amt > 0 ? "long" : "short",
+    qty: absAmt,
+    entryPrice: Number.isFinite(entryPrice) ? entryPrice : null,
+    markPrice: Number.isFinite(markPrice) ? markPrice : null,
+    dryRun: false,
+    raw: (p?.info as Record<string, unknown> | undefined) ?? null,
+  };
 }

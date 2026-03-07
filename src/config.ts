@@ -52,6 +52,15 @@ export const config = {
   dryRun: (process.env.DRY_RUN ?? "true") === "true",
   binanceFuturesEmergencyRetries: Number(process.env.BINANCE_FUTURES_EMERGENCY_RETRIES ?? 2),
 
+  // Internal API (for discord-news-bot AI-trading proxy)
+  aiTradingHttpEnabled: (process.env.AI_TRADING_HTTP_ENABLED ?? "true") === "true",
+  aiTradingHost: process.env.AI_TRADING_HOST ?? "0.0.0.0",
+  aiTradingPort: Number(process.env.AI_TRADING_PORT ?? process.env.PORT ?? 8787),
+  aiTradingInternalToken: process.env.AI_TRADING_INTERNAL_TOKEN ?? "",
+  aiTradingOrderPath: process.env.AI_TRADING_ORDER_PATH ?? "/internal/binance/order",
+  aiTradingPositionPath: process.env.AI_TRADING_POSITION_PATH ?? "/internal/binance/position",
+  runBotLoop: (process.env.RUN_BOT_LOOP ?? "true") === "true",
+
   // Capital handling
   initialCapital: Number(process.env.INITIAL_CAPITAL ?? 3000),
   equitySplit: (process.env.EQUITY_SPLIT ?? "true") === "true",

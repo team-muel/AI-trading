@@ -1,5 +1,17 @@
+function normalizeCompactUsdtSymbol(input: string): string {
+  const s = input.trim().toUpperCase();
+  if (!s || s.includes("/") || s.includes(":")) return input.trim();
+
+  // BTCUSDT -> BTC/USDT
+  if (s.endsWith("USDT") && s.length > 4) {
+    return `${s.slice(0, -4)}/USDT`;
+  }
+
+  return input.trim();
+}
+
 export function toBinanceSymbol(symbol: string, futures: boolean): string {
-  const s = symbol.trim();
+  const s = normalizeCompactUsdtSymbol(symbol);
   if (!s) return s;
 
   if (futures) {
